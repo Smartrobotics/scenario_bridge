@@ -1,0 +1,19 @@
+<launch>
+  <!-- SitePorter サーバー ⇄ scenario_control_json の HTTP ブリッジ。
+       docs/siteporter-bridge-api.ja.md 参照。
+
+       待受アドレスは docker0 (172.17.0.1)。バックエンドは別の compose ネットワークの
+       コンテナで動いており、host.docker.internal = 172.17.0.1 でホストへ来る。
+       127.0.0.1 では届かず、0.0.0.0 は - -network host のため LAN に開いてしまう。 -->
+  <arg name="host" default="172.17.0.1" />
+  <arg name="port" default="8080" />
+  <!-- 空なら scenario_control_json の ~scenario_dir と同じ場所を使う -->
+  <arg name="scenario_dir" default="" />
+
+  <node pkg="scenario_bridge" type="scenario_bridge.py" name="scenario_bridge"
+        output="screen" respawn="true" respawn_delay="3">
+    <param name="host" value="$(arg host)" />
+    <param name="port" value="$(arg port)" />
+    <param name="scenario_dir" value="$(arg scenario_dir)" />
+  </node>
+</launch>

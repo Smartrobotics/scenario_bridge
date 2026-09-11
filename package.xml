@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>scenario_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    SitePorter: HTTP と ROS の橋渡し。サーバー(FastAPI)からの POST /scenario, POST /cancel を
+    /scenario_name, /scenario_cancel に流し、/scenario_state を GET /state で返す。
+    仕様は Taisei_takuhai_system/docs/siteporter-bridge-api.ja.md。
+  </description>
+  <maintainer email="a-grishin@brexa.com">Aleksei Grishin</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>scenario_control</depend>
+  <!-- flask は Docker イメージに pip2 で入っている(takuhai_container_ws/Dockerfile) -->
+</package>
