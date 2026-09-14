@@ -13,6 +13,8 @@
   <buildtool_depend>catkin</buildtool_depend>
   <depend>rospy</depend>
   <depend>std_msgs</depend>
-  <depend>scenario_control</depend>
+  <!-- 実行時だけ(ScenarioState の Python モジュール)。build_depend にすると
+       scenario_control の CMake の不備で configure が落ちる -->
+  <exec_depend>scenario_control</exec_depend>
   <!-- flask は Docker イメージに pip2 で入っている(takuhai_container_ws/Dockerfile) -->
 </package>
