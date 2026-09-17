@@ -168,14 +168,24 @@ class Bridge(object):
         """
         同名がすでに投入済みで、まだ終わっていないか(仕様 §3.1 / §4.2)。
 
-        「終わった」はエンジンがその名前で終了状態を出したこと。
-        エンジンが IDLE を出しているときは再起動直後で、投入済みの名前は
-        忘れられている(§4.4 E)。その再送は duplicate ではない。
+        2つの根拠を見る:
+          1. エンジンの latched な状態がその名前で RUNNING
+             — ブリッジ自身が再起動して last_accepted を失っていても分かる。
+               2026-09-17: これを見ていなかったため、ブリッジを再起動するたびに
+               サーバーの再送を通してしまい、エンジンのキューに同じ断片が積まれて
+               pick_up が4回走った(荷台を載せたまま)。
+          2. 直近に受理した名前で、まだその名前の終了状態が来ていない
+             — publish から RUNNING が届くまでの短い窓を埋める。
+
+        エンジンが IDLE(再起動直後)なら投入済みの名前は忘れられている(§4.4 E)。
+        その再送は duplicate ではない。
         """
-        if name != self.last_accepted:
-            return False
         with self.lock:
             msg = self.state
+        if msg is not None and msg.scenario_name == name and msg.status == ScenarioState.RUNNING:
+            return True
+        if name != self.last_accepted:
+            return False
         if msg is None or msg.status == ScenarioState.IDLE:
             return False
         if msg.scenario_name == name and msg.status in TERMINAL:
@@ -272,6 +282,13 @@ def main():
         rospy.logerr('scenario_dir is not a directory: %s', scenario_dir)
 
     bridge = Bridge(scenario_dir)
+    # latched な /scenario_state が届くのを少し待ってから受け付ける。
+    # 再起動直後にサーバーの再送が来ると、状態を知らないまま「重複ではない」と
+    # 答えてしまう。エンジンが居なければ届かないので、上限つき
+    deadline = time.time() + 2.0
+    while bridge.state is None and time.time() < deadline and not rospy.is_shutdown():
+        time.sleep(0.05)
+    rospy.loginfo('initial /scenario_state: %s', 'received' if bridge.state is not None else 'none')
     app = make_app(bridge)
 
     # werkzeug のアクセスログは 1 秒ごとの GET /state で埋まるので黙らせる
