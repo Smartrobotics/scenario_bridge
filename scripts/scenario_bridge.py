@@ -117,11 +117,17 @@ class Bridge(object):
     # ------------------------------------------------------------ 状態
     def _on_state(self, msg):
         with self.lock:
+            prev = self.state
             self.state = msg
         if msg.status in TERMINAL or msg.status == ScenarioState.IDLE:
             rospy.loginfo('/scenario_state %s %s step %d/%d %s',
                           STATUS_NAME.get(msg.status, msg.status), msg.scenario_name,
                           msg.step_index, msg.step_total, msg.reason)
+        elif msg.reason or (prev is not None and prev.reason):
+            # RUNNING の reason は一時停止の補足("emergency stop")。付いた/消えたを残す
+            rospy.logwarn('/scenario_state RUNNING %s step %d/%d %s paused: %s',
+                          msg.scenario_name, msg.step_index, msg.step_total, msg.action,
+                          msg.reason or '(released)')
 
     def _health_loop(self):
         master = rosgraph.Master('/scenario_bridge')
