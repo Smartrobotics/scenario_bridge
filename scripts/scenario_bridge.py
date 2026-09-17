@@ -41,6 +41,8 @@ from datetime import datetime, timedelta
 import rospy
 import rosgraph
 import rospkg
+import socket
+import xmlrpclib
 from flask import Flask, jsonify, request
 from std_msgs.msg import Bool, String
 
@@ -63,6 +65,11 @@ NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
 # ros_ok の確認周期。リクエストのたびにマスターへ聞きに行かない
 HEALTH_PERIOD_SEC = 1.0
 
+# シナリオを実行するノード。これが /scenario_name を購読していて生きているときだけ
+# ros_ok。/ros_bridge など他のノードも /scenario_name を購読しているので、
+# 「誰か購読している」では足りない(2026-09-17: エンジンを kill しても true のままだった)
+ENGINE_NODE = '/scenario_control_json'
+
 # stamp を ISO8601 にするときのタイムゾーン(コンテナは UTC で動いている)
 TZ_OFFSET_HOURS = 9
 
@@ -82,8 +89,11 @@ def iso_stamp(stamp):
 class Bridge(object):
     """ROS との接点。latched な /scenario_state の最新値を持ち、publish を引き受ける"""
 
-    def __init__(self, scenario_dir):
+    def __init__(self, scenario_dir, engine_node=ENGINE_NODE):
         self.scenario_dir = scenario_dir
+        self.engine_node = engine_node
+        # ノードへの XML-RPC が固まらないように
+        socket.setdefaulttimeout(1.0)
         self.started = time.time()
         self.lock = threading.Lock()
 
@@ -116,13 +126,26 @@ class Bridge(object):
     def _health_loop(self):
         master = rosgraph.Master('/scenario_bridge')
         while not rospy.is_shutdown():
+            # エンジンが /scenario_name を購読しているかはマスターに聞く。
+            # publisher の get_num_connections() は購読側のプロセスが死んでも
+            # 減らないことがあり(2026-09-17: エンジンを kill しても true のまま)、
+            # それでは投げた断片が誰にも届かないのに ros_ok を返してしまう
+            ok, engine = False, False
             try:
-                master.getPid()
+                _, subs, _ = master.getSystemState()
                 ok = True
+                registered = False
+                for topic, nodes in subs:
+                    if topic == '/scenario_name' and self.engine_node in nodes:
+                        registered = True
+                        break
+                # 登録が残っていても落ちていることがある(kill -9 など)。ノード自身に聞く
+                if registered:
+                    uri = master.lookupNode(self.engine_node)
+                    code, _, _ = xmlrpclib.ServerProxy(uri).getPid('/scenario_bridge')
+                    engine = (code == 1)
             except Exception:
-                ok = False
-            # エンジンが /scenario_name を購読していなければ、投げても届かない
-            engine = self.pub_name.get_num_connections() > 0
+                engine = False
             if ok != self.master_ok or engine != self.engine_ok:
                 rospy.logwarn('ros_ok: master=%s engine=%s', ok, engine)
             self.master_ok, self.engine_ok = ok, engine
@@ -277,11 +300,12 @@ def main():
     host = rospy.get_param('~host', '172.17.0.1')
     port = int(rospy.get_param('~port', 8080))
     scenario_dir = rospy.get_param('~scenario_dir', '') or default_scenario_dir()
+    engine_node = rospy.get_param('~engine_node', ENGINE_NODE)
 
     if not os.path.isdir(scenario_dir):
         rospy.logerr('scenario_dir is not a directory: %s', scenario_dir)
 
-    bridge = Bridge(scenario_dir)
+    bridge = Bridge(scenario_dir, engine_node)
     # latched な /scenario_state が届くのを少し待ってから受け付ける。
     # 再起動直後にサーバーの再送が来ると、状態を知らないまま「重複ではない」と
     # 答えてしまう。エンジンが居なければ届かないので、上限つき
