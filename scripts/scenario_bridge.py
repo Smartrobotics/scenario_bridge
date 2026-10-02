@@ -1,32 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-scenario_bridge — SitePorter サーバー(FastAPI) と scenario_control_json の橋渡し。
-
-サーバーは ROS を持たない(ホストは ROS2、コンテナは ROS1 Melodic / Python 2.7)。
-そこでこのノードが HTTP を受け、ROS トピックに流す。仕様は
-docs/siteporter-bridge-api.ja.md。ここでは仕様の §3 をそのまま実装する。
-
-    POST /scenario {"name": "run_123_04_elv", "run_id": 123}
-         → /scenario_name (std_msgs/String) に publish
-    GET  /state
-         → /scenario_state (scenario_control/ScenarioState, latched) の最新値 + 死活情報
-    POST /cancel
-         → /scenario_cancel (std_msgs/Bool true) に publish
-
-判断はサーバー側(engine.py)が行う。ここは「投げる・返す」に徹するが、
-サーバーの再送ロジックが成り立つための3点だけはこちらで守る:
-
-  1. duplicate — 同じ名前を二重に publish しない。
-     エンジンはキューを持つので、二重に届くと SUCCESS の後にもう一度走る。
-  2. ros_ok — マスターに繋がり、かつエンジンが /scenario_name を購読しているときだけ true。
-     エンジンが居ないのに 202 を返すと、名前は誰にも届かず、サーバーは IDLE を見て
-     再送し、こちらは duplicate と答え、永久に止まる。
-  3. /scenario_name は latch しない。
-     latch すると、エンジンが再起動したときに最後の名前を受け取ってもう一度走る。
-
-Python 2.7 / rospy / Flask 1.1 で動く。
-"""
 
 from __future__ import print_function
 
@@ -48,7 +21,6 @@ from std_msgs.msg import Bool, String
 
 from scenario_control.msg import ScenarioState
 
-# ---------------------------------------------------------------- 定数
 
 STATUS_NAME = {
     ScenarioState.IDLE: 'IDLE',
@@ -59,23 +31,16 @@ STATUS_NAME = {
 }
 TERMINAL = (ScenarioState.SUCCESS, ScenarioState.FAILURE, ScenarioState.CANCELED)
 
-# 仕様 §3.1: 拡張子なしのファイル名。`/` と `..` は不可
 NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
 
-# ros_ok の確認周期。リクエストのたびにマスターへ聞きに行かない
 HEALTH_PERIOD_SEC = 1.0
 
-# シナリオを実行するノード。これが /scenario_name を購読していて生きているときだけ
-# ros_ok。/ros_bridge など他のノードも /scenario_name を購読しているので、
-# 「誰か購読している」では足りない(2026-09-17: エンジンを kill しても true のままだった)
 ENGINE_NODE = '/scenario_control_json'
 
-# stamp を ISO8601 にするときのタイムゾーン(コンテナは UTC で動いている)
 TZ_OFFSET_HOURS = 9
 
 
 def iso_stamp(stamp):
-    """rospy.Time → '2026-09-08T10:21:04.310+09:00'"""
     if stamp is None or stamp.to_sec() == 0.0:
         stamp = rospy.Time.now()
     dt = datetime.utcfromtimestamp(stamp.to_sec()) + timedelta(hours=TZ_OFFSET_HOURS)
@@ -84,27 +49,21 @@ def iso_stamp(stamp):
                                  dt.microsecond // 1000, sign, abs(TZ_OFFSET_HOURS))
 
 
-# ---------------------------------------------------------------- ROS 側
-
 class Bridge(object):
-    """ROS との接点。latched な /scenario_state の最新値を持ち、publish を引き受ける"""
-
     def __init__(self, scenario_dir, engine_node=ENGINE_NODE):
         self.scenario_dir = scenario_dir
         self.engine_node = engine_node
-        # ノードへの XML-RPC が固まらないように
         socket.setdefaulttimeout(1.0)
         self.started = time.time()
         self.lock = threading.Lock()
 
-        self.state = None          # 最後に受けた ScenarioState。まだ無ければ None
-        self.last_accepted = None  # 直近に受理して publish した名前
+        self.state = None
+        self.last_accepted = None
         self.last_accepted_at = 0.0
 
         self.master_ok = False
         self.engine_ok = False
 
-        # latch=False。理由は冒頭の 3.
         self.pub_name = rospy.Publisher('/scenario_name', String, queue_size=10, latch=False)
         self.pub_cancel = rospy.Publisher('/scenario_cancel', Bool, queue_size=10, latch=False)
         self.sub_state = rospy.Subscriber('/scenario_state', ScenarioState,
@@ -114,7 +73,6 @@ class Bridge(object):
         self._health_thread.daemon = True
         self._health_thread.start()
 
-    # ------------------------------------------------------------ 状態
     def _on_state(self, msg):
         with self.lock:
             prev = self.state
@@ -124,7 +82,6 @@ class Bridge(object):
                           STATUS_NAME.get(msg.status, msg.status), msg.scenario_name,
                           msg.step_index, msg.step_total, msg.reason)
         elif msg.reason or (prev is not None and prev.reason):
-            # RUNNING の reason は一時停止の補足("emergency stop")。付いた/消えたを残す
             rospy.logwarn('/scenario_state RUNNING %s step %d/%d %s paused: %s',
                           msg.scenario_name, msg.step_index, msg.step_total, msg.action,
                           msg.reason or '(released)')
@@ -132,10 +89,6 @@ class Bridge(object):
     def _health_loop(self):
         master = rosgraph.Master('/scenario_bridge')
         while not rospy.is_shutdown():
-            # エンジンが /scenario_name を購読しているかはマスターに聞く。
-            # publisher の get_num_connections() は購読側のプロセスが死んでも
-            # 減らないことがあり(2026-09-17: エンジンを kill しても true のまま)、
-            # それでは投げた断片が誰にも届かないのに ros_ok を返してしまう
             ok, engine = False, False
             try:
                 _, subs, _ = master.getSystemState()
@@ -145,7 +98,6 @@ class Bridge(object):
                     if topic == '/scenario_name' and self.engine_node in nodes:
                         registered = True
                         break
-                # 登録が残っていても落ちていることがある(kill -9 など)。ノード自身に聞く
                 if registered:
                     uri = master.lookupNode(self.engine_node)
                     code, _, _ = xmlrpclib.ServerProxy(uri).getPid('/scenario_bridge')
@@ -165,11 +117,9 @@ class Bridge(object):
         return int(time.time() - self.started)
 
     def snapshot(self):
-        """GET /state の本文"""
         with self.lock:
             msg = self.state
         if msg is None:
-            # まだ何も届いていない = エンジンがまだ居ない(latched なので居れば即届く)
             body = {
                 'status': 'IDLE', 'scenario_name': '', 'step_index': 0, 'step_total': 0,
                 'action': '', 'reason': '', 'queue_size': 0, 'stamp': iso_stamp(None),
@@ -189,26 +139,10 @@ class Bridge(object):
         body['uptime_sec'] = self.uptime_sec()
         return body
 
-    # ------------------------------------------------------------ 投入
     def scenario_exists(self, name):
         return os.path.isfile(os.path.join(self.scenario_dir, name + '.json'))
 
     def is_duplicate(self, name):
-        """
-        同名がすでに投入済みで、まだ終わっていないか(仕様 §3.1 / §4.2)。
-
-        2つの根拠を見る:
-          1. エンジンの latched な状態がその名前で RUNNING
-             — ブリッジ自身が再起動して last_accepted を失っていても分かる。
-               2026-09-17: これを見ていなかったため、ブリッジを再起動するたびに
-               サーバーの再送を通してしまい、エンジンのキューに同じ断片が積まれて
-               pick_up が4回走った(荷台を載せたまま)。
-          2. 直近に受理した名前で、まだその名前の終了状態が来ていない
-             — publish から RUNNING が届くまでの短い窓を埋める。
-
-        エンジンが IDLE(再起動直後)なら投入済みの名前は忘れられている(§4.4 E)。
-        その再送は duplicate ではない。
-        """
         with self.lock:
             msg = self.state
         if msg is not None and msg.scenario_name == name and msg.status == ScenarioState.RUNNING:
@@ -230,8 +164,6 @@ class Bridge(object):
     def publish_cancel(self):
         self.pub_cancel.publish(Bool(data=True))
 
-
-# ---------------------------------------------------------------- HTTP 側
 
 def make_app(bridge):
     app = Flask('scenario_bridge')
@@ -290,10 +222,7 @@ def make_app(bridge):
     return app
 
 
-# ---------------------------------------------------------------- main
-
 def default_scenario_dir():
-    """エンジンと同じディレクトリ。launch の ~scenario_dir が無ければ package の scenarios/"""
     d = rospy.get_param('/scenario_control_json/scenario_dir', '')
     if d:
         return d
@@ -312,16 +241,12 @@ def main():
         rospy.logerr('scenario_dir is not a directory: %s', scenario_dir)
 
     bridge = Bridge(scenario_dir, engine_node)
-    # latched な /scenario_state が届くのを少し待ってから受け付ける。
-    # 再起動直後にサーバーの再送が来ると、状態を知らないまま「重複ではない」と
-    # 答えてしまう。エンジンが居なければ届かないので、上限つき
     deadline = time.time() + 2.0
     while bridge.state is None and time.time() < deadline and not rospy.is_shutdown():
         time.sleep(0.05)
     rospy.loginfo('initial /scenario_state: %s', 'received' if bridge.state is not None else 'none')
     app = make_app(bridge)
 
-    # werkzeug のアクセスログは 1 秒ごとの GET /state で埋まるので黙らせる
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
     def serve():
@@ -332,7 +257,7 @@ def main():
             rospy.signal_shutdown('http server failed')
 
     t = threading.Thread(target=serve)
-    t.daemon = True   # roslaunch が止めたらプロセスごと終わる
+    t.daemon = True
     t.start()
 
     rospy.loginfo('scenario_bridge listening on http://%s:%d scenario_dir=%s',
